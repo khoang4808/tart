@@ -1,6 +1,7 @@
 import Foundation
 import Virtualization
 import Semaphore
+import Dynamic
 
 struct UnsupportedRestoreImageError: Error {
 }
@@ -65,7 +66,7 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     // Initialize the virtual machine and its configuration
     self.network = network
     configuration = try Self.craftConfiguration(diskURL: vmDir.diskURL,
-                                                nvramURL: vmDir.nvramURL, vmConfig: config,
+                                                nvramURL: vmDir.nvramURL, romURL: vmDir.romURL, vmConfig: config,
                                                 network: network, additionalStorageDevices: additionalStorageDevices,
                                                 directorySharingDevices: directorySharingDevices,
                                                 serialPorts: serialPorts,
@@ -147,6 +148,7 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
       vmDir: VMDirectory,
       ipswURL: URL,
       diskSizeGB: UInt16,
+      romURL: URL,
       diskFormat: DiskImageFormat = .raw,
       network: Network = NetworkShared(),
       additionalStorageDevices: [VZStorageDeviceConfiguration] = [],
@@ -193,11 +195,13 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
       // allocate at least 4 CPUs because otherwise VMs are frequently freezing
       try config.setCPU(cpuCount: max(4, requirements.minimumSupportedCPUCount))
       try config.save(toURL: vmDir.configURL)
+      
+      try FileManager.default.copyItem(atPath: romURL.path, toPath: vmDir.romURL.path)
 
       // Initialize the virtual machine and its configuration
       self.network = network
       configuration = try Self.craftConfiguration(diskURL: vmDir.diskURL, nvramURL: vmDir.nvramURL,
-                                                  vmConfig: config, network: network,
+                                                  romURL: vmDir.romURL, vmConfig: config, network: network,
                                                   additionalStorageDevices: additionalStorageDevices,
                                                   directorySharingDevices: directorySharingDevices,
                                                   serialPorts: serialPorts
@@ -240,17 +244,19 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     // Create config
     let config = VMConfig(platform: Linux(), cpuCountMin: 4, memorySizeMin: 4096 * 1024 * 1024, diskFormat: diskFormat)
     try config.save(toURL: vmDir.configURL)
+    
+    
 
     return try VM(vmDir: vmDir)
   }
 
-  func start(recovery: Bool, resume shouldResume: Bool, provisioning: GuestProvisioningOptions? = nil) async throws {
+  func start(recovery: Bool, resume shouldResume: Bool, provisioning: GuestProvisioningOptions? = nil, vmStartOptions: VMStartOptions) async throws {
     try network.run(sema)
 
     if shouldResume {
       try await resume()
     } else {
-      try await start(recovery, provisioning: provisioning)
+      try await start(recovery, provisioning: provisioning, vmStartOptions: vmStartOptions)
     }
   }
 
@@ -286,10 +292,21 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
   }
 
   @MainActor
-  private func start(_ recovery: Bool, provisioning: GuestProvisioningOptions? = nil) async throws {
+  private func start(_ recovery: Bool, provisioning: GuestProvisioningOptions? = nil, vmStartOptions: VMStartOptions) async throws {
     #if arch(arm64)
       let startOptions = VZMacOSVirtualMachineStartOptions()
+      let platformConfiguration = VZMacPlatformConfiguration()
+    let vmconfig = VZVirtualMachineConfiguration()
       startOptions.startUpFromMacOSRecovery = recovery
+          Dynamic(startOptions)._setForceDFU(vmStartOptions.forceDFU)
+          Dynamic(vmconfig)._setPanicAction(vmStartOptions.stopOnPanic)
+          Dynamic(startOptions)._setStopInIBootStage1(vmStartOptions.stopInIBootStage1)
+          Dynamic(startOptions)._setStopInIBootStage2(vmStartOptions.stopInIBootStage2)
+          Dynamic(platformConfiguration)._setProductionModeEnabled(!vmStartOptions.demoteProductionMode)
+
+          if #available(macOS 14, *) {
+            Dynamic(vmconfig)._setFatalErrorAction(vmStartOptions.stopOnFatalError)
+          }
       #if compiler(>=6.4)
         if let provisioning = provisioning, #available(macOS 27, *) {
           try startOptions.setGuestProvisioning(provisioning.toVZMacGuestProvisioningOptions())
@@ -314,6 +331,7 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
   static func craftConfiguration(
     diskURL: URL,
     nvramURL: URL,
+    romURL: URL,
     vmConfig: VMConfig,
     network: Network = NetworkShared(),
     additionalStorageDevices: [VZStorageDeviceConfiguration],
@@ -332,7 +350,9 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     let configuration = VZVirtualMachineConfiguration()
 
     // Boot loader
-    configuration.bootLoader = try vmConfig.platform.bootLoader(nvramURL: nvramURL)
+    let bootloader = try vmConfig.platform.bootLoader(nvramURL: nvramURL)
+        Dynamic(bootloader)._setROMURL(romURL)
+        configuration.bootLoader = bootloader
 
     // CPU and memory
     configuration.cpuCount = vmConfig.cpuCount
@@ -440,6 +460,24 @@ class VM: NSObject, VZVirtualMachineDelegate, ObservableObject {
     consoleDevice.ports[0] = consolePort
 
     configuration.consoleDevices.append(consoleDevice)
+    
+    // Debug port
+        let debugStub = Dynamic._VZGDBDebugStubConfiguration(port: vmConfig.debugPort);
+        Dynamic(configuration)._setDebugStub(debugStub);
+
+         // Serial console
+         let serialPort: VZSerialPortConfiguration = Dynamic._VZPL011SerialPortConfiguration().asObject as! VZSerialPortConfiguration
+         serialPort.attachment = VZFileHandleSerialPortAttachment(
+           fileHandleForReading: FileHandle.standardInput,
+           fileHandleForWriting: FileHandle.standardOutput
+         )
+         configuration.serialPorts = [serialPort]
+
+        // Panic device (needed on macOS 14+ when setPanicAction is enabled)
+        if #available(macOS 14, *) {
+          let panicDevice = Dynamic._VZPvPanicDeviceConfiguration()
+          Dynamic(configuration)._setPanicDevice(panicDevice)
+        }
 
     // Socket device
     configuration.socketDevices = [VZVirtioSocketDeviceConfiguration()]

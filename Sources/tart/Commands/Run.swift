@@ -67,6 +67,9 @@ struct Run: AsyncParsableCommand {
 
   @Argument(help: "VM name", completion: .custom(completeLocalMachines))
   var name: String
+  
+  @Flag(help: "Demote fusing mode to 01")
+  var demote: Bool = false
 
   @Flag(help: ArgumentHelp(
     "Don't open a UI window.",
@@ -99,6 +102,24 @@ struct Run: AsyncParsableCommand {
     @Flag(help: "Boot into recovery mode")
   #endif
   var recovery: Bool = false
+  
+  
+  @Flag(help: "Boot into DFU mode")
+  var dfu: Bool = false
+
+  @Flag(help: ArgumentHelp(
+    "Halt on fatal error",
+    discussion: "Requires host to be macOS 14.0 (Sonoma) or newer."))
+  var stopOnFatalError: Bool = false
+
+  @Flag(help: "Halt when panicked")
+  var stopOnPanic: Bool = false
+
+  @Flag(help: "Halt when loading iBootStage1")
+  var stopInIBootStage1: Bool = false
+
+  @Flag(help: "Halt when loading iBootStage2")
+  var stopInIBootStage2: Bool = false
 
   #if arch(arm64)
     @Flag(help: ArgumentHelp(
@@ -511,10 +532,18 @@ struct Run: AsyncParsableCommand {
             }
           }
         #endif
-
+        let startOptions = VMStartOptions(
+          startUpFromMacOSRecovery: recovery,
+          forceDFU: dfu,
+          stopOnFatalError: stopOnFatalError,
+          stopOnPanic: stopOnPanic,
+          stopInIBootStage1: stopInIBootStage1,
+          stopInIBootStage2: stopInIBootStage2,
+          demoteProductionMode: demote
+        )
         do {
           #if arch(arm64) && compiler(>=6.4)
-            try await vm!.start(recovery: recovery, resume: resume, provisioning: provisioning)
+            try await vm!.start(recovery: recovery, resume: resume, provisioning: provisioning, vmStartOptions: startOptions)
           #else
             try await vm!.start(recovery: recovery, resume: resume)
           #endif
